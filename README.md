@@ -484,6 +484,12 @@ If you encounter connection errors:
 3. Ensure the QuickBooks app has the correct redirect URIs
 4. For sandbox testing, use `QUICKBOOKS_ENVIRONMENT=sandbox`
 
+### Local error log
+
+Every caught error is also appended as one JSON line to a local troubleshooting log — timestamp, message, and, for QuickBooks API failures, the endpoint, HTTP status, and `intuit_tid` (never request/response bodies, so no customer data or tokens end up in it). Hand this file to Intuit support or grep it yourself when debugging.
+
+It defaults to `error.log` next to `QUICKBOOKS_TOKEN_STORE_PATH` when that's set, otherwise to `~/.config/quickbooks-mcp/error.log`, and is created with mode `0600`. Override the location with `QUICKBOOKS_ERROR_LOG_PATH` (an absolute path, set in the host process env — same restriction as `QUICKBOOKS_TOKEN_STORE_PATH`).
+
 ---
 
 ## Contributing
