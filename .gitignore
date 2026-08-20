@@ -9,6 +9,9 @@ coverage
 .env.*.local
 tokens.json
 
+# AES key protecting QUICKBOOKS_REFRESH_TOKEN_ENC in the token store
+.qbo-token-key
+
 start.cmd
 
 # Local capture output (may contain real account balances)

@@ -64,8 +64,10 @@ cp .env.example .env
 QUICKBOOKS_CLIENT_ID=your_client_id
 QUICKBOOKS_CLIENT_SECRET=your_client_secret
 QUICKBOOKS_ENVIRONMENT=sandbox
-QUICKBOOKS_REFRESH_TOKEN=your_refresh_token
 QUICKBOOKS_REALM_ID=your_realm_id
+
+# The refresh token is written here by the OAuth handshake, encrypted at rest as
+# QUICKBOOKS_REFRESH_TOKEN_ENC. See "Refresh token encryption at rest" below.
 
 # Optional: restrict which tool categories are registered (default: all enabled)
 # QUICKBOOKS_DISABLE_WRITE=true    # suppress create_* tools
@@ -75,7 +77,7 @@ QUICKBOOKS_REALM_ID=your_realm_id
 
 `.env` is gitignored so your real credentials stay local.
 
-> **Read-only or containerized installs:** the server reads `.env` at startup and writes the rotated refresh token back to it on each refresh. When the installed module sits on a **read-only filesystem** (a container with a read-only root, an immutable/Nix install), set `QUICKBOOKS_TOKEN_STORE_PATH` to an absolute, writable path for both operations. A per-tenant host can also point each connection at its own isolated token file this way. Three things to know: it must be set in the **host process env** (e.g. the `env` block of your MCP server config) — setting it inside `.env` has no effect, because the path is resolved before `.env` is read; it must be an **absolute** path (the server refuses to start otherwise); and when set, the package's own `.env` is not read at all, so any file-based config (including credentials) must live in the file it points to.
+> **Read-only or containerized installs:** the server reads `.env` at startup and writes the rotated refresh token back to it on each refresh. When the installed module sits on a **read-only filesystem** (a container with a read-only root, an immutable/Nix install), set `QUICKBOOKS_TOKEN_STORE_PATH` to an absolute, writable path for both operations. A per-tenant host can also point each connection at its own isolated token file this way. Three things to know: it must be set in the **host process env** (e.g. the `env` block of your MCP server config) — setting it inside `.env` has no effect, because the path is resolved before `.env` is read; it must be an **absolute** path (the server refuses to start otherwise); and when set, the package's own `.env` is not read at all, so any file-based config (including credentials) must live in the file it points to. The **directory** it points into must be writable too, not just the file — the `.qbo-token-key` encryption key file is created alongside the token store (see [Refresh token encryption at rest](#refresh-token-encryption-at-rest)), and it must persist across restarts on the same volume as the token store.
 
 ### Claude Code Integration
 
@@ -90,7 +92,6 @@ Add to your Claude Code MCP configuration:
       "env": {
         "QUICKBOOKS_CLIENT_ID": "your_client_id",
         "QUICKBOOKS_CLIENT_SECRET": "your_client_secret",
-        "QUICKBOOKS_REFRESH_TOKEN": "your_refresh_token",
         "QUICKBOOKS_REALM_ID": "your_realm_id",
         "QUICKBOOKS_ENVIRONMENT": "sandbox",
         "QUICKBOOKS_DISABLE_WRITE": "false",
@@ -399,10 +400,22 @@ After completing the production OAuth handshake, the refresh token is what matte
 ```env
 QUICKBOOKS_CLIENT_ID=your_client_id
 QUICKBOOKS_CLIENT_SECRET=your_client_secret
-QUICKBOOKS_REFRESH_TOKEN=your_refresh_token
+QUICKBOOKS_REFRESH_TOKEN_ENC=<AES-256-GCM blob, written by the handshake>
 QUICKBOOKS_REALM_ID=your_realm_id
 QUICKBOOKS_ENVIRONMENT=sandbox  # or 'production'
 ```
+
+### Refresh token encryption at rest
+
+[Intuit's app security requirements](https://developer.intuit.com/app/developer/qbo/docs/go-live/publish-app/security-requirements) call for the refresh token to be encrypted with a symmetric algorithm (AES preferred) and for the key to be stored in a separate configuration file. This server does both automatically — there is nothing to configure.
+
+- The refresh token is written as **`QUICKBOOKS_REFRESH_TOKEN_ENC`**, an AES-256-GCM blob serialized as `base64(iv):base64(authTag):base64(ciphertext)`. You never paste this by hand; the OAuth handshake and each token rotation write it for you.
+- The AES-256 key is generated on first use with `crypto.randomBytes(32)` and stored **in its own file**, `.qbo-token-key`, in the same directory as the token store, with mode `0600`. It is never written into the token store itself and never committed.
+- `QUICKBOOKS_REALM_ID` stays plaintext — it is a company identifier, not a secret, and is outside the scope of the encryption requirement.
+
+> **Back up the two files together.** The blob cannot be decrypted without `.qbo-token-key`, and the key is worthless without the blob. If the key file is lost, the stored token is unrecoverable and the company must be re-authorized. If `.qbo-token-key` exists but is not a valid 32-byte base64 key, the server fails loudly rather than minting a replacement key that would silently orphan the token.
+
+**Upgrading from a plaintext store.** If the token store still holds a plaintext `QUICKBOOKS_REFRESH_TOKEN` and no `QUICKBOOKS_REFRESH_TOKEN_ENC`, the server migrates it on the next start: it mints a key if needed, writes the encrypted value, and removes the plaintext line. No action is required, and the running token keeps working. The encrypted value deliberately uses a **different variable name** so that a half-migrated file can never be mistaken for the other format.
 
 ### Common pitfalls
 

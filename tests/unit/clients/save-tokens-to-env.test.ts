@@ -12,6 +12,7 @@
  * 4. isSymbolicLink: fails closed (returns false) on any fs error.
  */
 import { jest } from '@jest/globals';
+import nodeCrypto from 'crypto';
 
 process.env.QUICKBOOKS_CLIENT_ID = 'test-client-id';
 process.env.QUICKBOOKS_CLIENT_SECRET = 'test-client-secret';
@@ -32,13 +33,25 @@ const writeFileSyncSpy = jest.fn<(p: string, data: string, options?: any) => voi
 const renameSyncSpy = jest.fn<(o: string, n: string) => void>();
 const unlinkSyncSpy = jest.fn<(p: string) => void>();
 
+// The refresh token is stored encrypted, so the fs mock has to model TWO files:
+// the token store and the sibling AES key file. A fixed key keeps ciphertext
+// decryptable by the assertions below.
+const TEST_KEY_B64 = Buffer.alloc(32, 7).toString('base64');
+const isKeyPath = (p: unknown) => String(p).endsWith('.qbo-token-key');
+
 jest.unstable_mockModule('fs', () => ({
   default: {
     existsSync: jest.fn(() => true),
-    readFileSync: jest.fn(() => 'QUICKBOOKS_REFRESH_TOKEN=old-token\nQUICKBOOKS_REALM_ID=99999\n'),
+    readFileSync: jest.fn((p: unknown) =>
+      isKeyPath(p)
+        ? TEST_KEY_B64
+        : 'QUICKBOOKS_REFRESH_TOKEN=old-token\nQUICKBOOKS_REALM_ID=99999\n',
+    ),
     writeFileSync: writeFileSyncSpy,
     renameSync: renameSyncSpy,
     unlinkSync: unlinkSyncSpy,
+    mkdirSync: jest.fn(),
+    chmodSync: jest.fn(),
     lstatSync: jest.fn(() => {
       if (lstatBehavior === 'throws') throw new Error('EACCES');
       return { isSymbolicLink: () => lstatBehavior === 'symlink' };
@@ -51,6 +64,19 @@ jest.unstable_mockModule('fs', () => ({
     readlinkSync: jest.fn(() => readlinkTarget),
   },
 }));
+
+// Mirror of the client's decryption, so assertions verify the value actually
+// round-trips rather than merely that SOME ciphertext was written.
+function decryptWritten(content: string): string {
+  const line = content.split('\n').find((l) => l.startsWith('QUICKBOOKS_REFRESH_TOKEN_ENC='));
+  if (!line) throw new Error(`no encrypted token line in: ${content}`);
+  const [iv, tag, ct] = line.slice('QUICKBOOKS_REFRESH_TOKEN_ENC='.length)
+    .split(':')
+    .map((p) => Buffer.from(p, 'base64'));
+  const decipher = nodeCrypto.createDecipheriv('aes-256-gcm', Buffer.from(TEST_KEY_B64, 'base64'), iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf-8');
+}
 
 // Each test needs a unique refresh token so saveTokensToEnv is triggered
 // (it only runs when newRefreshToken !== this.refreshToken).
@@ -128,11 +154,12 @@ describe('saveTokensToEnv (via authenticate)', () => {
     await quickbooksClient.authenticate();
 
     expect(renameSyncSpy).not.toHaveBeenCalled();
-    expect(writeFileSyncSpy).toHaveBeenCalledWith(
-      REAL_PATH,
-      expect.stringContaining(`QUICKBOOKS_REFRESH_TOKEN=rotated-${tokenCounter}`),
-      expect.objectContaining({ mode: 0o600 }),
-    );
+    const [writtenPath, content, opts] = writeFileSyncSpy.mock.calls.at(-1)!;
+    expect(writtenPath).toBe(REAL_PATH);
+    expect(opts).toEqual(expect.objectContaining({ mode: 0o600 }));
+    expect(decryptWritten(content)).toBe(`rotated-${tokenCounter}`);
+    // The plaintext line from the pre-encryption store must be gone.
+    expect(content).not.toMatch(/^QUICKBOOKS_REFRESH_TOKEN=/m);
   });
 
   it('handles dangling symlink with an ABSOLUTE target via readlinkSync fallback', async () => {
@@ -143,11 +170,10 @@ describe('saveTokensToEnv (via authenticate)', () => {
     await quickbooksClient.authenticate();
 
     expect(renameSyncSpy).not.toHaveBeenCalled();
-    expect(writeFileSyncSpy).toHaveBeenCalledWith(
-      LINK_TARGET,
-      expect.stringContaining(`QUICKBOOKS_REFRESH_TOKEN=rotated-${tokenCounter}`),
-      expect.objectContaining({ mode: 0o600 }),
-    );
+    const [writtenPath, content, opts] = writeFileSyncSpy.mock.calls.at(-1)!;
+    expect(writtenPath).toBe(LINK_TARGET);
+    expect(opts).toEqual(expect.objectContaining({ mode: 0o600 }));
+    expect(decryptWritten(content)).toBe(`rotated-${tokenCounter}`);
   });
 
   it('resolves a RELATIVE dangling-symlink target against the link directory', async () => {

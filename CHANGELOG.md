@@ -5,6 +5,30 @@ All notable changes to the QuickBooks Online MCP Server are documented in this f
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- The refresh token is now encrypted at rest with AES-256-GCM rather than stored as
+  plaintext in the token store. It is written as `QUICKBOOKS_REFRESH_TOKEN_ENC` (an
+  authenticated ciphertext blob); the AES key is generated on first use and kept in a
+  separate sibling file, `.qbo-token-key` (mode `0600`), alongside the token store —
+  never inside it. Brings the server in line with Intuit's app security requirement
+  that the refresh token be encrypted with a symmetric algorithm and the key stored
+  separately. A store still holding a legacy plaintext `QUICKBOOKS_REFRESH_TOKEN` is
+  migrated automatically and transparently on the next start; no action is required.
+  `QUICKBOOKS_REALM_ID` is unaffected (it's a company identifier, not a secret).
+
+### Fixed
+
+- OAuth callback server (`startOAuthFlow()`) no longer renders HTML directly on the
+  `/callback` URL, which carries the auth code/state in its query string. It now returns a
+  `302` redirect to a param-free route (`/callback/processing`, `/callback/complete`, or
+  `/callback/error`), and that route renders the page. Brings the flow in line with Intuit's
+  QBO app security requirements ("must not return HTML content" at a URL carrying sensitive
+  parameters). Behavior (state check, duplicate-callback guard, saved tokens, server
+  shutdown) is unchanged — only the response mechanics.
+
 ## [0.0.1] - 2024-01-13
 
 ### Summary

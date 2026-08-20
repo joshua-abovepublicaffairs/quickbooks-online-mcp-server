@@ -23,13 +23,24 @@ process.env.QUICKBOOKS_TOKEN_STORE_PATH = STORE_PATH;
 const writeFileSyncSpy = jest.fn<(p: string, data: string, options?: any) => void>();
 const renameSyncSpy = jest.fn<(o: string, n: string) => void>();
 
+// The token store and the sibling AES key file are distinct paths.
+const TEST_KEY_B64 = Buffer.alloc(32, 7).toString('base64');
+const isKeyPath = (p: unknown) => String(p).endsWith('.qbo-token-key');
+const readFileSyncSpy = jest.fn((p: unknown) =>
+  isKeyPath(p)
+    ? TEST_KEY_B64
+    : 'QUICKBOOKS_REFRESH_TOKEN=old-token\nQUICKBOOKS_REALM_ID=99999\n',
+);
+
 jest.unstable_mockModule('fs', () => ({
   default: {
     existsSync: jest.fn(() => true),
-    readFileSync: jest.fn(() => 'QUICKBOOKS_REFRESH_TOKEN=old-token\nQUICKBOOKS_REALM_ID=99999\n'),
+    readFileSync: readFileSyncSpy,
     writeFileSync: writeFileSyncSpy,
     renameSync: renameSyncSpy,
     unlinkSync: jest.fn(),
+    mkdirSync: jest.fn(),
+    chmodSync: jest.fn(),
     lstatSync: jest.fn(() => ({ isSymbolicLink: () => false })),
     realpathSync: jest.fn(() => STORE_PATH),
     readlinkSync: jest.fn(() => STORE_PATH),
@@ -92,8 +103,13 @@ describe('QUICKBOOKS_TOKEN_STORE_PATH override', () => {
     expect(String(destPath).endsWith('/dist/.env')).toBe(false);
     expect(writeFileSyncSpy).toHaveBeenCalledWith(
       expect.stringContaining(`${STORE_PATH}.tmp.`),
-      expect.stringContaining(`QUICKBOOKS_REFRESH_TOKEN=rotated-${tokenCounter}`),
+      expect.stringContaining('QUICKBOOKS_REFRESH_TOKEN_ENC='),
       expect.objectContaining({ mode: 0o600 }),
     );
+    // The AES key is read from beside the CONFIGURED store, not from the
+    // module-relative default directory.
+    const keyReads = readFileSyncSpy.mock.calls.map(([p]) => String(p)).filter(isKeyPath);
+    expect(keyReads.length).toBeGreaterThan(0);
+    expect(new Set(keyReads)).toEqual(new Set(['/writable-volume/.qbo-token-key']));
   });
 });

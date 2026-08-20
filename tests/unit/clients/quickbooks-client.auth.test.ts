@@ -102,6 +102,10 @@ jest.unstable_mockModule('fs', () => ({
     writeFileSync: jest.fn(),
     renameSync: jest.fn(),
     unlinkSync: jest.fn(),
+    // Persisting the refresh token encrypts it, which mints an AES key file on
+    // first use (readFileSync above reports it missing).
+    mkdirSync: jest.fn(),
+    chmodSync: jest.fn(),
   },
 }));
 
