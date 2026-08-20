@@ -463,12 +463,18 @@ export class QuickbooksClient {
     return new Error(cause ? `${msg} (cause: ${cause})` : msg);
   }
 
-  private async startOAuthFlow(): Promise<void> {
+  private async startOAuthFlow(interactive = false): Promise<void> {
     // The interactive flow below binds a localhost callback server, but Intuit
     // rejects localhost redirect URIs for production apps — so this can only
-    // ever succeed in sandbox. Fail fast with guidance rather than opening a
-    // doomed browser window on a production server.
-    if (this.environment === 'production') {
+    // succeed unattended in sandbox. `interactive: true` is set only by the
+    // `npm run auth` CLI entry point, where a human has already configured
+    // QUICKBOOKS_REDIRECT_URI to a public HTTPS tunnel (ngrok) forwarding to
+    // this same local server — see README "Production Setup". Every other
+    // caller (the MCP server's own automatic reauth-on-refresh-failure path)
+    // leaves this false, so a dead token mid-life still fails fast with
+    // guidance instead of opening a doomed browser window with nobody
+    // watching.
+    if (this.environment === 'production' && !interactive) {
       throw this.reauthError();
     }
 
@@ -484,11 +490,18 @@ export class QuickbooksClient {
     // points elsewhere (e.g. the OAuth playground used for manual token
     // generation). Intuit rejects the exchange if the redirect_uri does not
     // match the one used in the authorize request.
+    //
+    // The production exception: Intuit won't accept a localhost redirect there,
+    // so the human runs a public HTTPS tunnel that forwards to this same local
+    // port. Honor the configured URI in that case — it still reaches the server
+    // below, and authorize/exchange stay matched because both use this client.
+    const flowRedirectUri =
+      this.environment === 'production' ? this.redirectUri : `http://localhost:${port}/callback`;
     const flowClient = new OAuthClient({
       clientId: this.clientId,
       clientSecret: this.clientSecret,
       environment: this.environment,
-      redirectUri: `http://localhost:${port}/callback`,
+      redirectUri: flowRedirectUri,
     });
 
     return new Promise((resolve, reject) => {
@@ -816,15 +829,17 @@ export class QuickbooksClient {
     return this.refreshInFlight;
   }
 
-  async authenticate(): Promise<QuickBooks> {
+  async authenticate(options?: { interactive?: boolean }): Promise<QuickBooks> {
     if (this.authInFlight) {
       return this.authInFlight;
     }
 
+    const interactive = options?.interactive ?? false;
+
     this.authInFlight = (async () => {
       try {
         if (!this.refreshToken || !this.realmId) {
-          await this.startOAuthFlow();
+          await this.startOAuthFlow(interactive);
 
           // Verify we have both tokens after OAuth flow
           if (!this.refreshToken || !this.realmId) {

@@ -51,6 +51,11 @@ jest.unstable_mockModule('dotenv', () => ({
 const refreshDispatch = jest.fn<(token: string) => Promise<unknown>>();
 const openMock = jest.fn(async () => undefined);
 
+// Every OAuthClient the module constructs, in order. The interactive-handshake
+// tests read the LAST one (the per-flow client) to assert which redirect_uri the
+// authorize request was built with.
+const oauthInstances: { cfg: Record<string, unknown> }[] = [];
+
 jest.unstable_mockModule('intuit-oauth', () => {
   class MockOAuthClient {
     static scopes = { Accounting: 'com.intuit.quickbooks.accounting' };
@@ -60,6 +65,7 @@ jest.unstable_mockModule('intuit-oauth', () => {
     authorizeUri = jest.fn(() => 'https://appcenter.intuit.com/connect/oauth2?mock');
     constructor(cfg: Record<string, unknown>) {
       this.cfg = cfg;
+      oauthInstances.push(this as unknown as { cfg: Record<string, unknown> });
     }
   }
   return { default: MockOAuthClient };
@@ -156,6 +162,7 @@ beforeEach(() => {
   refreshDispatch.mockReset();
   fsReadFileSync.mockReset();
   openMock.mockClear();
+  oauthInstances.length = 0;
   serverCreated = false;
   fsReadFileSync.mockImplementation(() => {
     throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
@@ -322,6 +329,79 @@ describe('production dead-token handling', () => {
     refreshDispatch.mockRejectedValue(outer);
 
     await expect(client.authenticate()).rejects.toThrow(/cannot be renewed automatically in production/);
+  });
+});
+
+// The counterpart to the block above: production refuses to open a browser for
+// UNATTENDED callers, but `npm run auth` is a human sitting at one, having
+// already pointed QUICKBOOKS_REDIRECT_URI at a public HTTPS tunnel per README
+// "Production Setup". Only that entry point passes interactive: true.
+describe('production interactive handshake (npm run auth)', () => {
+  // Drop the refresh token so authenticate() takes the cold-start branch into
+  // startOAuthFlow() rather than trying to refresh first.
+  const makeUnauthedProdClient = () => {
+    const client = makeClient({ environment: 'production', refreshToken: '' });
+    (client as unknown as { refreshToken?: string }).refreshToken = undefined;
+    return client;
+  };
+
+  // The flow parks on a promise that only settles when a callback arrives, so
+  // these tests kick it off and assert on the side effects instead of awaiting.
+  // Poll for the browser launch rather than createServer: the latter is
+  // synchronous, but authorizeUri() and open() run in listen()'s callback a tick
+  // later, so waiting on the server alone races them.
+  const untilFlowStarted = async (timeoutMs = 2000) => {
+    const start = Date.now();
+    while (openMock.mock.calls.length === 0) {
+      if (Date.now() - start > timeoutMs) throw new Error('OAuth flow never opened a browser');
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  };
+
+  it('opens the interactive flow instead of throwing the reauth error', async () => {
+    const client = makeUnauthedProdClient();
+
+    void client.authenticate({ interactive: true }).catch(() => {});
+    await untilFlowStarted();
+
+    expect(serverCreated).toBe(true);
+    expect(openMock).toHaveBeenCalled();
+  });
+
+  it('authorizes with the configured public HTTPS redirect, never localhost', async () => {
+    const client = makeUnauthedProdClient();
+
+    void client.authenticate({ interactive: true }).catch(() => {});
+    await untilFlowStarted();
+
+    // Intuit rejects the code exchange when authorize and exchange disagree on
+    // redirect_uri, so the flow client must carry the tunnel URL, not localhost.
+    const flowClient = oauthInstances[oauthInstances.length - 1];
+    expect(flowClient.cfg.redirectUri).toBe('https://developer.intuit.com/v2/OAuth2Playground/RedirectUrl');
+    expect(flowClient.cfg.redirectUri).not.toMatch(/localhost/);
+  });
+
+  it('still refuses the browser flow in production when the caller is unattended', async () => {
+    // Same cold-start state, but without the interactive opt-in: the default
+    // stays fail-fast, so the MCP server can never hang on a login nobody sees.
+    const client = makeUnauthedProdClient();
+
+    await expect(client.authenticate()).rejects.toThrow(/cannot be renewed automatically in production/);
+    expect(serverCreated).toBe(false);
+    expect(openMock).not.toHaveBeenCalled();
+  });
+
+  it('uses the localhost callback in sandbox even when interactive', async () => {
+    // Sandbox keeps the localhost redirect regardless of QUICKBOOKS_REDIRECT_URI
+    // — the public-tunnel exception is production-only.
+    const client = makeClient({ environment: 'sandbox', refreshToken: '' });
+    (client as unknown as { refreshToken?: string }).refreshToken = undefined;
+
+    void client.authenticate({ interactive: true }).catch(() => {});
+    await untilFlowStarted();
+
+    const flowClient = oauthInstances[oauthInstances.length - 1];
+    expect(flowClient.cfg.redirectUri).toBe('http://localhost:8000/callback');
   });
 });
 

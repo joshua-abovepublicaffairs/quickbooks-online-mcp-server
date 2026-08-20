@@ -27,8 +27,11 @@ async function main() {
   console.log('A browser window will open for you to authorize the application.\n');
 
   try {
-    // The authenticate method will trigger the OAuth flow if no tokens exist
-    await quickbooksClient.authenticate();
+    // The authenticate method will trigger the OAuth flow if no tokens exist.
+    // interactive: a human is at a browser right now, so production is allowed
+    // to open one. Unattended callers (the MCP server itself) leave this off and
+    // still fail fast — see startOAuthFlow() and README "Production Setup".
+    await quickbooksClient.authenticate({ interactive: true });
 
     console.log('\n✓ Successfully authenticated with QuickBooks!');
     console.log('Tokens have been saved to your .env file.');
