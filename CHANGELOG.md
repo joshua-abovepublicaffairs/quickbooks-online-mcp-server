@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `npm run auth` could not complete a **production** OAuth handshake at all —
+  `startOAuthFlow()` refused unconditionally whenever `QUICKBOOKS_ENVIRONMENT=production`,
+  even with a public HTTPS redirect (e.g. an ngrok tunnel) already configured per this
+  README's own "Production Setup" section. `authenticate()` now accepts an
+  `{ interactive: true }` option, set only by the `npm run auth` CLI entry point, that
+  allows the flow to proceed in production and authorize against the configured
+  `QUICKBOOKS_REDIRECT_URI` instead of a hardcoded localhost URL. Every other caller —
+  in particular the MCP server's own automatic reauth-on-refresh-failure path — leaves
+  this off, so a dead token discovered mid-life still fails fast with an actionable error
+  rather than opening a browser window nobody is watching. Verified against a real
+  production company end to end.
+
 ### Added
 
 - Every caught error is now logged to a local troubleshooting file
