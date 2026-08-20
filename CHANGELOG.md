@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Every caught error is now logged to a local troubleshooting file
+  (`~/.config/quickbooks-mcp/error.log` by default, or beside the token store when
+  `QUICKBOOKS_TOKEN_STORE_PATH` is set; override directly with `QUICKBOOKS_ERROR_LOG_PATH`)
+  with the request operation, HTTP status, and QuickBooks' `intuit_tid` header when present —
+  the identifier Intuit support uses to look up a specific failed call. Addresses their App
+  Assessment Questionnaire's request to capture `intuit_tid`. This is a side-channel log only:
+  the error message returned to the MCP client is unchanged, and request/response bodies are
+  never written to the log.
+
 ### Security
 
 - The refresh token is now encrypted at rest with AES-256-GCM rather than stored as

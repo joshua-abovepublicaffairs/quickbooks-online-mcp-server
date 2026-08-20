@@ -1,9 +1,12 @@
+import { logError } from "./error-log.js";
+
 /**
  * Formats an error into a standardized error message
  * @param error Any error object to format
  * @returns A formatted error message as a string
  */
 export function formatError(error: unknown): string {
+  logError(error);
   if (error instanceof Error) {
     return `Error: ${error.message}`;
   } else if (typeof error === 'string') {

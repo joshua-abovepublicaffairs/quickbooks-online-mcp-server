@@ -1,6 +1,24 @@
-import { formatError } from '../../../src/helpers/format-error';
+import { jest } from '@jest/globals';
+
+const logErrorSpy = jest.fn();
+
+jest.unstable_mockModule('../../../src/helpers/error-log', () => ({
+  logError: logErrorSpy,
+}));
+
+const { formatError } = await import('../../../src/helpers/format-error');
 
 describe('formatError', () => {
+  beforeEach(() => {
+    logErrorSpy.mockClear();
+  });
+
+  it('logs every caught error to the troubleshooting log', () => {
+    const error = new Error('Something went wrong');
+    formatError(error);
+    expect(logErrorSpy).toHaveBeenCalledWith(error);
+  });
+
   it('should format Error instances', () => {
     const error = new Error('Something went wrong');
     expect(formatError(error)).toBe('Error: Something went wrong');
