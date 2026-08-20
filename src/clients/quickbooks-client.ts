@@ -507,54 +507,21 @@ export class QuickbooksClient {
       // tokens written into our .env instead of ours.
       const expectedState = crypto.randomBytes(24).toString('hex');
 
-      // Create temporary server for OAuth callback
-      const server = http.createServer(async (req, res) => {
-        console.log(`[auth-server] ${req.method} ${req.url}`);
+      // Intuit's app security requirements forbid returning HTML at a URL that
+      // carries the auth code/state, so /callback only ever 302s to one of these
+      // param-free paths and the HTML is rendered there instead.
+      const PROCESSING_PATH = '/callback/processing';
+      const COMPLETE_PATH = '/callback/complete';
+      const ERROR_PATH = '/callback/error';
 
-        // Respond to anything that isn't /callback so diagnostic probes (curl,
-        // ngrok health checks, favicon requests, etc.) don't hang the server.
-        if (!req.url?.startsWith('/callback')) {
-          res.writeHead(404, { 'Content-Type': 'text/plain' });
-          res.end('Not Found. Waiting for QuickBooks OAuth callback at /callback');
-          return;
-        }
-
-        // Reject any callback whose state doesn't match this run's authorize
-        // request, before touching codeExchangeStarted, so a spoofed/scanner
-        // hit can't consume the one-shot exchange lock and lock out the real
-        // callback that follows it.
-        const incomingState = new URL(req.url, `http://localhost:${port}`).searchParams.get('state');
-        if (incomingState !== expectedState) {
-          console.log(`[auth-server] Rejected callback with mismatched state (got: ${incomingState ?? 'none'})`);
-          res.writeHead(400, { 'Content-Type': 'text/plain' });
-          res.end('Invalid or missing state parameter.');
-          return;
-        }
-
-        // A duplicate callback for the same code must NOT be exchanged again, or
-        // Intuit revokes the token minted by the first hit. `codeExchangeStarted`
-        // is set synchronously before the first `await`, so the second request's
-        // handler observes it and bails out here.
-        if (codeExchangeStarted) {
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end('<html><body style="font-family:Arial;text-align:center;margin-top:20vh"><h2>Processing… you can close this window.</h2></body></html>');
-          return;
-        }
-        codeExchangeStarted = true;
-
-        {
-          try {
-            const response = await flowClient.createToken(req.url);
-            const tokens = response.token;
-
-            // Save tokens
-            this.refreshToken = tokens.refresh_token;
-            this.realmId = tokens.realmId;
-            this.saveTokensToEnv();
-
-            // Send success response
-            res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(`
+      const resultPages: Record<string, { status: number; html: string }> = {
+        [PROCESSING_PATH]: {
+          status: 200,
+          html: '<html><body style="font-family:Arial;text-align:center;margin-top:20vh"><h2>Processing… you can close this window.</h2></body></html>',
+        },
+        [COMPLETE_PATH]: {
+          status: 200,
+          html: `
               <html>
                 <body style="
                   display: flex;
@@ -570,18 +537,11 @@ export class QuickbooksClient {
                   <p>You can close this window now.</p>
                 </body>
               </html>
-            `);
-
-            // Close server after a short delay
-            setTimeout(() => {
-              server.close();
-              this.isAuthenticating = false;
-              resolve();
-            }, 1000);
-          } catch (error) {
-            console.error('Error during token creation:', error);
-            res.writeHead(500, { 'Content-Type': 'text/html' });
-            res.end(`
+            `,
+        },
+        [ERROR_PATH]: {
+          status: 500,
+          html: `
               <html>
                 <body style="
                   display: flex;
@@ -597,9 +557,109 @@ export class QuickbooksClient {
                   <p>Please check the console for more details.</p>
                 </body>
               </html>
-            `);
-            this.isAuthenticating = false;
-            reject(error);
+            `,
+        },
+      };
+
+      // Only pages the flow has actually reached are servable, so a stray probe
+      // can't render "success" before the exchange happened.
+      const servablePages = new Set<string>();
+
+      let settled = false;
+      const shutdown = () => {
+        if (settled) return;
+        settled = true;
+        server.close();
+        this.isAuthenticating = false;
+        resolve();
+      };
+
+      // Held until the browser has fetched the error page, so rejecting (which
+      // exits the CLI) doesn't race the redirect the user is following.
+      let pendingError: unknown;
+      const fail = () => {
+        if (settled) return;
+        settled = true;
+        this.isAuthenticating = false;
+        reject(pendingError);
+      };
+
+      // Create temporary server for OAuth callback
+      const server = http.createServer(async (req, res) => {
+        console.log(`[auth-server] ${req.method} ${req.url}`);
+
+        const requestUrl = req.url ?? '/';
+        const pathname = new URL(requestUrl, `http://localhost:${port}`).pathname;
+
+        const page = resultPages[pathname];
+        if (page && servablePages.has(pathname)) {
+          res.writeHead(page.status, { 'Content-Type': 'text/html' });
+          res.end(page.html);
+          if (pathname === COMPLETE_PATH) {
+            setTimeout(shutdown, 1000);
+          } else if (pathname === ERROR_PATH) {
+            fail();
+          }
+          return;
+        }
+
+        // Respond to anything that isn't /callback so diagnostic probes (curl,
+        // ngrok health checks, favicon requests, etc.) don't hang the server.
+        if (pathname !== '/callback') {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not Found. Waiting for QuickBooks OAuth callback at /callback');
+          return;
+        }
+
+        // Reject any callback whose state doesn't match this run's authorize
+        // request, before touching codeExchangeStarted, so a spoofed/scanner
+        // hit can't consume the one-shot exchange lock and lock out the real
+        // callback that follows it.
+        const incomingState = new URL(requestUrl, `http://localhost:${port}`).searchParams.get('state');
+        if (incomingState !== expectedState) {
+          console.log(`[auth-server] Rejected callback with mismatched state (got: ${incomingState ?? 'none'})`);
+          res.writeHead(400, { 'Content-Type': 'text/plain' });
+          res.end('Invalid or missing state parameter.');
+          return;
+        }
+
+        // A duplicate callback for the same code must NOT be exchanged again, or
+        // Intuit revokes the token minted by the first hit. `codeExchangeStarted`
+        // is set synchronously before the first `await`, so the second request's
+        // handler observes it and bails out here.
+        if (codeExchangeStarted) {
+          servablePages.add(PROCESSING_PATH);
+          res.writeHead(302, { Location: PROCESSING_PATH });
+          res.end();
+          return;
+        }
+        codeExchangeStarted = true;
+
+        {
+          try {
+            const response = await flowClient.createToken(requestUrl);
+            const tokens = response.token;
+
+            // Save tokens
+            this.refreshToken = tokens.refresh_token;
+            this.realmId = tokens.realmId;
+            this.saveTokensToEnv();
+
+            // Send success response
+            servablePages.add(COMPLETE_PATH);
+            res.writeHead(302, { Location: COMPLETE_PATH });
+            res.end();
+
+            // Close server after a short delay, whether or not the browser
+            // follows the redirect to the completion page.
+            setTimeout(shutdown, 5000);
+          } catch (error) {
+            console.error('Error during token creation:', error);
+            pendingError = error;
+            servablePages.add(ERROR_PATH);
+            res.writeHead(302, { Location: ERROR_PATH });
+            res.end();
+            setTimeout(fail, 5000);
           }
         }
       });
