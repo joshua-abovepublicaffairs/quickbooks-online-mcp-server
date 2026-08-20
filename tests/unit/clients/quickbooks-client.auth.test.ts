@@ -191,7 +191,7 @@ describe('QuickbooksClient.authenticate', () => {
 
     // The flow's new refresh token was then exchanged for an access token.
     expect(refreshDispatch).toHaveBeenLastCalledWith('flow-refresh-token');
-    expect(res.writeHead).toHaveBeenCalledWith(200, { 'Content-Type': 'text/html' });
+    expect(res.writeHead).toHaveBeenCalledWith(302, { Location: '/callback/complete' });
   }, 15000);
 
   it('rejects a callback whose state does not match the one from this run\'s authorize request', async () => {
