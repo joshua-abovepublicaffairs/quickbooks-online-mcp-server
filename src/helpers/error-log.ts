@@ -29,10 +29,41 @@ export interface ErrorLogEntry {
   intuitTid?: string;
 }
 
+// Pull the safe half out of a QuickBooks Fault body. `code` and `Message` are
+// from Intuit's fixed error catalogue; `Detail` is NOT — it echoes the submitted
+// payload (customer names, amounts, account names, addresses), so it is never
+// read here.
+function faultSummary(error: object): string | undefined {
+  const fault = (error as { Fault?: unknown }).Fault;
+  if (!fault || typeof fault !== "object") return undefined;
+  const faults = (fault as { Error?: unknown }).Error;
+  if (!Array.isArray(faults)) return undefined;
+
+  const parts: string[] = [];
+  for (const entry of faults) {
+    if (!entry || typeof entry !== "object") continue;
+    const { code, Message } = entry as { code?: unknown; Message?: unknown };
+    const bits: string[] = [];
+    if (typeof code === "string") bits.push(`code ${code}`);
+    if (typeof Message === "string") bits.push(Message);
+    if (bits.length > 0) parts.push(bits.join(": "));
+  }
+  return parts.length > 0 ? `QuickBooks Fault (${parts.join("; ")})` : undefined;
+}
+
 function rawMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
-  return JSON.stringify(error);
+  // Objects reaching here are overwhelmingly node-quickbooks Fault bodies: on a
+  // Fault the client invokes callback(body, ...) with the RAW response object,
+  // so stringifying it wholesale would dump customer data into the log. Keep the
+  // allow-listed Fault fields and withhold everything else — the operation,
+  // status, and intuitTid captured below are what support triage actually needs.
+  if (error !== null && typeof error === "object") {
+    return faultSummary(error) ?? "Non-Error object (contents withheld)";
+  }
+  // Primitives can't carry a response body.
+  return String(error);
 }
 
 // Best-effort extraction of the request path from an axios request URL,
@@ -90,6 +121,47 @@ export function buildLogEntry(error: unknown): ErrorLogEntry {
   return entry;
 }
 
+// Cap the log so a persistent failure (revoked token, wrong realm, Intuit
+// outage) can't fill the volume: every tool call errors, and each one appends.
+// At the cap the current file becomes a single .1 backup and a fresh log
+// starts, bounding total usage at two files.
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
+
+// The directory create, the size probe, and the chmod each only need to succeed
+// once per process. Repeating them made every logged error four blocking
+// syscalls, which serializes the server during an error storm — a dead refresh
+// token fails all ~430 handler call sites. Only the append stays per-call.
+let logDirReady = false;
+let logFileBytes: number | undefined;
+let logModeSet = false;
+
+function ensureLogDir(): void {
+  if (logDirReady) return;
+  fs.mkdirSync(path.dirname(ERROR_LOG_PATH), { recursive: true });
+  logDirReady = true;
+}
+
+function currentLogBytes(): number {
+  if (logFileBytes === undefined) {
+    try {
+      logFileBytes = fs.statSync(ERROR_LOG_PATH).size;
+    } catch {
+      logFileBytes = 0; // no log yet
+    }
+  }
+  return logFileBytes;
+}
+
+function rotateLog(): void {
+  try {
+    fs.renameSync(ERROR_LOG_PATH, `${ERROR_LOG_PATH}.1`);
+  } catch {
+    return; // couldn't rotate — keep appending rather than drop the entry
+  }
+  logFileBytes = 0;
+  logModeSet = false; // the fresh file needs its mode restated
+}
+
 /**
  * Appends one JSON line to the local troubleshooting log for every caught
  * error, so a failure can be handed to Intuit support or replayed later.
@@ -98,15 +170,25 @@ export function buildLogEntry(error: unknown): ErrorLogEntry {
  */
 export function logError(error: unknown): void {
   try {
-    const line = JSON.stringify({ timestamp: new Date().toISOString(), ...buildLogEntry(error) });
-    fs.mkdirSync(path.dirname(ERROR_LOG_PATH), { recursive: true });
-    fs.appendFileSync(ERROR_LOG_PATH, line + "\n", { mode: 0o600 });
-    // appendFileSync's mode only applies when the file is newly created and is
-    // masked by the process umask even then, so restate it explicitly.
-    try {
-      fs.chmodSync(ERROR_LOG_PATH, 0o600);
-    } catch {
-      /* best effort */
+    const line =
+      JSON.stringify({ timestamp: new Date().toISOString(), ...buildLogEntry(error) }) + "\n";
+    const bytes = Buffer.byteLength(line);
+
+    ensureLogDir();
+    if (currentLogBytes() + bytes > MAX_LOG_BYTES) rotateLog();
+
+    fs.appendFileSync(ERROR_LOG_PATH, line, { mode: 0o600 });
+    logFileBytes = currentLogBytes() + bytes;
+
+    if (!logModeSet) {
+      // appendFileSync's mode only applies when the file is newly created and is
+      // masked by the process umask even then, so restate it explicitly.
+      try {
+        fs.chmodSync(ERROR_LOG_PATH, 0o600);
+      } catch {
+        /* best effort */
+      }
+      logModeSet = true;
     }
   } catch {
     /* the troubleshooting log is best-effort and must never break the caller */

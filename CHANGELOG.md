@@ -7,8 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The local troubleshooting error log could leak customer data. When QuickBooks
+  rejects a request (a "Fault"), the raw response body — which can echo the
+  submitted customer name, email, address, or amount — was being written to
+  the log verbatim. It now records only the fixed, non-sensitive error code
+  and message from Intuit's Fault catalogue; the rest of the body is withheld.
+- The AES-256-GCM refresh-token migration could silently leave the old
+  plaintext token on disk. A token store written with an `export ` prefix, a
+  `KEY: value` line, or extra whitespace — all forms the server's own `.env`
+  loader accepts — was read and encrypted correctly, but the plaintext line
+  wasn't recognized for removal, so it stayed on disk indefinitely even though
+  the migration reported success. Removal now uses the same matching rules as
+  the reader, and the migration verifies the plaintext line is actually gone
+  before it logs success.
+- The AES key protecting the refresh token can now be stored on a different
+  path than the token store itself via `QUICKBOOKS_TOKEN_KEY_PATH`. By default
+  the key sits right beside the token store, which only protects against a
+  single-file leak — a backup or directory copy still captures both files
+  together.
+- A token store reached through a symlink (containers, persistent volumes)
+  could keep looser file permissions than intended after being rewritten with
+  the new encrypted token; it's now explicitly restricted to owner-only (0600)
+  after every write, matching the non-symlink path.
+- The OAuth callback server now binds to loopback only instead of every
+  network interface, so the callback URL (which briefly carries a live
+  authorization code) isn't reachable from other machines on the network
+  during the `npm run auth` handshake.
+
 ### Fixed
 
+- A failed OAuth token exchange (expired code, network blip, Intuit outage)
+  left the local callback server's port permanently open, so every later
+  `npm run auth` attempt failed with a confusing "address in use" error
+  instead of the real problem — the only fix was restarting the process. The
+  server is now released whenever the exchange fails.
+- Two authorization attempts starting at nearly the same moment could produce
+  a stray "failed to obtain tokens" error even though the first attempt was
+  still legitimately in progress. A concurrent request now waits for the
+  in-flight handshake to finish instead of failing early.
 - `npm run auth` could not complete a **production** OAuth handshake at all —
   `startOAuthFlow()` refused unconditionally whenever `QUICKBOOKS_ENVIRONMENT=production`,
   even with a public HTTPS redirect (e.g. an ngrok tunnel) already configured per this
@@ -30,7 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the identifier Intuit support uses to look up a specific failed call. Addresses their App
   Assessment Questionnaire's request to capture `intuit_tid`. This is a side-channel log only:
   the error message returned to the MCP client is unchanged, and request/response bodies are
-  never written to the log.
+  never written to the log. The log is capped at 5 MB and rotates to a single backup file,
+  so a persistent failure (a dead token, a QuickBooks outage) can't grow it without bound.
 
 ### Security
 
@@ -53,6 +92,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   QBO app security requirements ("must not return HTML content" at a URL carrying sensitive
   parameters). Behavior (state check, duplicate-callback guard, saved tokens, server
   shutdown) is unchanged — only the response mechanics.
+- `npm run lint` was failing for everyone — the repo had ESLint 9 as a dependency but no
+  `eslint.config.js`. Added a flat config so the lint gate actually runs.
 
 ## [0.0.1] - 2024-01-13
 

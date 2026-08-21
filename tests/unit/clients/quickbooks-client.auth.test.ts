@@ -216,4 +216,71 @@ describe('QuickbooksClient.authenticate', () => {
     expect(res.writeHead).toHaveBeenCalledWith(400, { 'Content-Type': 'text/plain' });
     expect(createTokenDispatch).not.toHaveBeenCalled();
   });
+
+  it('closes the callback server when the code exchange fails, so a later flow can bind again', async () => {
+    // A leaked listener here is not merely untidy: the port stays bound for the
+    // life of the process, so the NEXT startOAuthFlow() dies on EADDRINUSE and
+    // reports that instead of the real authorization error.
+    // The preceding test deliberately abandons a handshake mid-flight, leaving
+    // both shared promises pending forever — authInFlight, and now oauthInFlight
+    // (the point of the in-flight fix: a concurrent caller awaits the real flow
+    // instead of racing ahead of it). Clear both to start from a clean slate.
+    const internals = quickbooksClient as unknown as {
+      authInFlight?: Promise<unknown>;
+      oauthInFlight?: Promise<void>;
+      isAuthenticating: boolean;
+    };
+    internals.authInFlight = undefined;
+    internals.oauthInFlight = undefined;
+    internals.isAuthenticating = false;
+
+    (quickbooksClient as unknown as { accessTokenExpiry?: Date }).accessTokenExpiry = new Date(0);
+    refreshDispatch.mockRejectedValueOnce(new Error('invalid_grant'));
+    createTokenDispatch.mockRejectedValueOnce(new Error('invalid_grant: authorization code expired'));
+    callbackHandler = undefined;
+
+    const failedAuth = quickbooksClient.authenticate();
+    const settled = failedAuth.then(
+      () => 'resolved',
+      () => 'rejected'
+    );
+
+    await untilCallbackRegistered();
+
+    // The callback URL carries a live auth code, so the listener must be
+    // loopback-only — binding '::' exposed it to the whole LAN, which matters
+    // more now that the production handshake can run behind a public tunnel.
+    expect(fakeServer.listen).toHaveBeenCalledWith(8000, '127.0.0.1', expect.any(Function));
+
+    const flowClient = oauthInstances[oauthInstances.length - 1];
+    await untilAuthorizeUriCalled(flowClient);
+    const { state } = flowClient.authorizeUri.mock.calls[0][0] as { state: string };
+
+    // The exchange throws, so /callback 302s to the param-free error page.
+    const res = { writeHead: jest.fn(), end: jest.fn() };
+    await callbackHandler!({ url: `/callback?code=abc&state=${state}`, method: 'GET' }, res);
+    expect(res.writeHead).toHaveBeenCalledWith(302, { Location: '/callback/error' });
+
+    // Following that redirect settles the flow immediately rather than waiting
+    // out the 5s fallback timer.
+    const errorRes = { writeHead: jest.fn(), end: jest.fn() };
+    await callbackHandler!({ url: '/callback/error', method: 'GET' }, errorRes);
+    expect(errorRes.writeHead).toHaveBeenCalledWith(500, { 'Content-Type': 'text/html' });
+
+    expect(await settled).toBe('rejected');
+
+    // The point of the test: the failure path releases the port.
+    expect(fakeServer.close).toHaveBeenCalled();
+
+    // And a subsequent attempt gets to bind again instead of dying on EADDRINUSE.
+    callbackHandler = undefined;
+    (quickbooksClient as unknown as { accessTokenExpiry?: Date }).accessTokenExpiry = new Date(0);
+    void quickbooksClient.authenticate().catch(() => {});
+    await untilCallbackRegistered();
+
+    // Two binds in this test: the flow that failed, then the retry. A leaked
+    // listener would have made this second one throw EADDRINUSE for real.
+    expect(fakeServer.listen).toHaveBeenCalledTimes(2);
+    expect(fakeServer.listen.mock.calls[1]).toEqual([8000, '127.0.0.1', expect.any(Function)]);
+  }, 15000);
 });

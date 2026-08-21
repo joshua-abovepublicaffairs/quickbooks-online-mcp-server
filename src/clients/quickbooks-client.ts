@@ -46,7 +46,21 @@ const TOKEN_STORE_PATH =
 // QUICKBOOKS_REFRESH_TOKEN: a half-migrated store would otherwise feed
 // ciphertext to Intuit (or plaintext to the decryptor) with no way to tell which
 // it was holding.
-const TOKEN_KEY_PATH = path.join(path.dirname(TOKEN_STORE_PATH), '.qbo-token-key');
+//
+// The default sits beside the token store, which defeats only a single-file
+// leak — a `cp -r`, tar, or volume snapshot of that directory still captures
+// both halves. QUICKBOOKS_TOKEN_KEY_PATH moves the key onto a different volume
+// (or a mount the backup job skips) so the separation is real. Resolved from
+// the host process env before dotenv loads, and absolute for the same reason
+// QUICKBOOKS_TOKEN_STORE_PATH is.
+const tokenKeyPathOverride = process.env.QUICKBOOKS_TOKEN_KEY_PATH?.trim();
+if (tokenKeyPathOverride && !path.isAbsolute(tokenKeyPathOverride)) {
+  throw Error(
+    `QUICKBOOKS_TOKEN_KEY_PATH must be an absolute path, got "${tokenKeyPathOverride}"`
+  );
+}
+const TOKEN_KEY_PATH =
+  tokenKeyPathOverride || path.join(path.dirname(TOKEN_STORE_PATH), '.qbo-token-key');
 const ENC_TOKEN_VAR = 'QUICKBOOKS_REFRESH_TOKEN_ENC';
 const PLAINTEXT_TOKEN_VAR = 'QUICKBOOKS_REFRESH_TOKEN';
 
@@ -149,6 +163,26 @@ function resolveRefreshToken(vars: Record<string, string | undefined>): string |
   return vars[PLAINTEXT_TOKEN_VAR]?.trim() || undefined;
 }
 
+// Match an assignment line for `name` the way dotenv's own parser does: optional
+// leading whitespace, an optional `export ` prefix, optional space around the
+// separator, and `:` + space as an alternative to `=`.
+//
+// This has to agree with dotenv.parse(), because the two are used as a pair —
+// the migration READS the plaintext token with dotenv and DELETES it with this.
+// An ad-hoc `line.startsWith(name + '=')` matches none of those three forms, so
+// `export QUICKBOOKS_REFRESH_TOKEN=...` (written that way so the file can also be
+// sourced in a shell) was read, encrypted, and then left on disk while the
+// migration logged success — the plaintext secret surviving is precisely the
+// thing at-rest encryption exists to prevent.
+//
+// The trailing separator is what keeps this from over-matching: the
+// QUICKBOOKS_REFRESH_TOKEN matcher does not match a QUICKBOOKS_REFRESH_TOKEN_ENC
+// line, because `_` is neither `=` nor `:`.
+function tokenStoreLineMatcher(name: string): RegExp {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^\\s*(?:export\\s+)?${escaped}\\s*(?:=|:\\s)`);
+}
+
 // Rewrite the token store, setting `updates` and dropping `removeNames`.
 // Shared by saveTokensToEnv() and the plaintext migration so both get the same
 // atomic-write and symlink-target handling.
@@ -158,7 +192,8 @@ function writeTokenStore(updates: Record<string, string>, removeNames: string[] 
   let envLines = envContent.split('\n');
 
   for (const [name, value] of Object.entries(updates)) {
-    const index = envLines.findIndex((line) => line.startsWith(`${name}=`));
+    const matcher = tokenStoreLineMatcher(name);
+    const index = envLines.findIndex((line) => matcher.test(line));
     if (index !== -1) {
       envLines[index] = `${name}=${value}`;
     } else {
@@ -166,7 +201,8 @@ function writeTokenStore(updates: Record<string, string>, removeNames: string[] 
     }
   }
   if (removeNames.length > 0) {
-    envLines = envLines.filter((line) => !removeNames.some((name) => line.startsWith(`${name}=`)));
+    const matchers = removeNames.map(tokenStoreLineMatcher);
+    envLines = envLines.filter((line) => !matchers.some((matcher) => matcher.test(line)));
   }
 
   const newContent = envLines.join('\n');
@@ -199,6 +235,11 @@ function writeTokenStore(updates: Record<string, string>, removeNames: string[] 
     // directly. This trades atomicity for correct persistent-volume behavior — a
     // crash mid-write could leave the target .env partially written.
     fs.writeFileSync(realPath, newContent, { mode: 0o600 });
+    // writeFileSync only honors `mode` when it CREATES the file, so an existing
+    // symlink target keeps whatever permissions it already had (0644 on a fresh
+    // volume mount). The temp-file+rename branch below gets 0600 for free from
+    // the new file; this branch has to restate it.
+    try { fs.chmodSync(realPath, 0o600); } catch { /* best effort */ }
   } else {
     // Atomic write: write to a sibling temp file, then rename. On POSIX
     // rename is atomic within the same filesystem, so a crash mid-write
@@ -244,6 +285,22 @@ function migratePlaintextRefreshToken(): void {
     // below reads the same state a fresh start would.
     process.env[ENC_TOKEN_VAR] = encrypted;
     delete process.env[PLAINTEXT_TOKEN_VAR];
+
+    // Re-read and confirm the plaintext actually left the file before claiming
+    // success. The whole point of this migration is that the secret stops being
+    // readable at rest, and a silent partial migration — ciphertext written,
+    // plaintext still sitting there — is indistinguishable from a real one from
+    // the outside, because resolveRefreshToken() prefers the ciphertext and
+    // nothing else ever looks.
+    if (dotenv.parse(fs.readFileSync(TOKEN_STORE_PATH))?.[PLAINTEXT_TOKEN_VAR]?.trim()) {
+      console.error(
+        `[qbo-client] WARNING: encrypted the refresh token, but the plaintext ` +
+        `${PLAINTEXT_TOKEN_VAR} line is still present in ${TOKEN_STORE_PATH}. ` +
+        `The server will use the encrypted value, but delete that line by hand — ` +
+        `until you do, the refresh token remains readable at rest.`
+      );
+      return;
+    }
     console.error('[qbo-client] Migrated plaintext refresh token to encrypted at-rest storage');
   } catch (e) {
     console.error('[qbo-client] Failed to migrate plaintext refresh token to encrypted storage:', e);
@@ -309,6 +366,13 @@ export class QuickbooksClient {
   // concurrent first callers cannot both pass the freshness check and both
   // invoke startOAuthFlow() / rebuild the QuickBooks instance.
   private authInFlight?: Promise<QuickBooks>;
+
+  // Shared in-flight OAuth promise. A second caller that arrives mid-handshake
+  // must AWAIT the running flow, not return immediately — returning early let
+  // authenticate() observe the not-yet-populated tokens and throw a misleading
+  // "Failed to obtain required tokens from OAuth flow" while the real flow was
+  // still in progress.
+  private oauthInFlight?: Promise<void>;
 
   constructor(config: {
     clientId: string;
@@ -478,10 +542,19 @@ export class QuickbooksClient {
       throw this.reauthError();
     }
 
-    if (this.isAuthenticating) {
-      return;
+    // Await the running handshake rather than resolving straight away, so a
+    // concurrent caller sees the tokens the first flow obtains.
+    if (this.oauthInFlight) {
+      return this.oauthInFlight;
     }
 
+    this.oauthInFlight = this.runOAuthFlow().finally(() => {
+      this.oauthInFlight = undefined;
+    });
+    return this.oauthInFlight;
+  }
+
+  private async runOAuthFlow(): Promise<void> {
     this.isAuthenticating = true;
     const port = 8000;
 
@@ -593,6 +666,11 @@ export class QuickbooksClient {
       const fail = () => {
         if (settled) return;
         settled = true;
+        // Release the port on the failure path too. Leaking the listener here
+        // would make the NEXT startOAuthFlow() die on EADDRINUSE and report
+        // that instead of the real authorization error, for the life of the
+        // process.
+        server.close();
         this.isAuthenticating = false;
         reject(pendingError);
       };
@@ -677,9 +755,13 @@ export class QuickbooksClient {
         }
       });
 
-      // Start server — bind to all interfaces (IPv4 + IPv6) so ngrok can reach it
-      // regardless of whether it resolves `localhost` to 127.0.0.1 or ::1
-      server.listen(port, '::', async () => {
+      // Start server — loopback only. This carries a live auth code, so it must
+      // not be reachable from the LAN; binding '::' previously exposed it to the
+      // whole network, which matters more now that the production handshake can
+      // run behind a public tunnel. 127.0.0.1 is what `ngrok http 8000` forwards
+      // to, and a browser sent to `localhost` falls back to IPv4 immediately
+      // when ::1 refuses on loopback.
+      server.listen(port, '127.0.0.1', async () => {
         const addr = server.address();
         console.log(`[auth-server] Listening on ${typeof addr === 'string' ? addr : `${addr?.address}:${addr?.port}`} (family: ${typeof addr === 'object' ? addr?.family : 'n/a'})`);
 

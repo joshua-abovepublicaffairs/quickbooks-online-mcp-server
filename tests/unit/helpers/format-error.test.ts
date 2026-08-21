@@ -13,9 +13,24 @@ describe('formatError', () => {
     logErrorSpy.mockClear();
   });
 
-  it('logs every caught error to the troubleshooting log', () => {
+  it('logs every caught error to the troubleshooting log by default', () => {
     const error = new Error('Something went wrong');
     formatError(error);
+    expect(logErrorSpy).toHaveBeenCalledWith(error);
+  });
+
+  it('skips the log when the caller opts out, still returning the message', () => {
+    // The disk write is a side effect on a formatting helper, so a caller that
+    // has already logged this error (or wants the string without the I/O) can
+    // turn it off explicitly.
+    const error = new Error('already logged upstream');
+    expect(formatError(error, { log: false })).toBe('Error: already logged upstream');
+    expect(logErrorSpy).not.toHaveBeenCalled();
+  });
+
+  it('logs when passed options that do not disable logging', () => {
+    const error = new Error('boom');
+    formatError(error, {});
     expect(logErrorSpy).toHaveBeenCalledWith(error);
   });
 

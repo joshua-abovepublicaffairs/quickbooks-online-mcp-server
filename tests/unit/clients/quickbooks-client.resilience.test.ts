@@ -413,7 +413,7 @@ describe('sandbox transient handling', () => {
 
     const msg = await messageOf(client.authenticate());
     expect(msg).toMatch(/Failed to refresh Quickbooks token/);
-    expect(serverCreated).toBe(false); // no doomed/​spurious browser flow
+    expect(serverCreated).toBe(false); // no doomed/spurious browser flow
     expect(openMock).not.toHaveBeenCalled();
     expect(tokenOf(client)).toBe('valid-sbx'); // token NOT discarded
   });

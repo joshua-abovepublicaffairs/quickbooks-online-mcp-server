@@ -39,14 +39,16 @@ const unlinkSyncSpy = jest.fn<(p: string) => void>();
 const TEST_KEY_B64 = Buffer.alloc(32, 7).toString('base64');
 const isKeyPath = (p: unknown) => String(p).endsWith('.qbo-token-key');
 
+// Contents the mocked token store reports. Mutable so tests can supply the
+// alternative assignment forms dotenv accepts (export prefix, leading
+// whitespace, `KEY: value`) and check they are rewritten, not just read.
+const DEFAULT_STORE = 'QUICKBOOKS_REFRESH_TOKEN=old-token\nQUICKBOOKS_REALM_ID=99999\n';
+let storeContent = DEFAULT_STORE;
+
 jest.unstable_mockModule('fs', () => ({
   default: {
     existsSync: jest.fn(() => true),
-    readFileSync: jest.fn((p: unknown) =>
-      isKeyPath(p)
-        ? TEST_KEY_B64
-        : 'QUICKBOOKS_REFRESH_TOKEN=old-token\nQUICKBOOKS_REALM_ID=99999\n',
-    ),
+    readFileSync: jest.fn((p: unknown) => (isKeyPath(p) ? TEST_KEY_B64 : storeContent)),
     writeFileSync: writeFileSyncSpy,
     renameSync: renameSyncSpy,
     unlinkSync: unlinkSyncSpy,
@@ -121,6 +123,7 @@ describe('saveTokensToEnv (via authenticate)', () => {
     lstatBehavior = 'regular';
     realpathBehavior = 'ok';
     readlinkTarget = LINK_TARGET;
+    storeContent = DEFAULT_STORE;
     tokenCounter++;
     refreshDispatch.mockResolvedValue({
       token: {
@@ -211,5 +214,59 @@ describe('saveTokensToEnv (via authenticate)', () => {
     // authenticate() catches saveTokensToEnv errors (line 336-338 in source)
     // and logs them; it should NOT throw.
     await expect(quickbooksClient.authenticate()).resolves.not.toThrow();
+  });
+
+  // The plaintext line is removed with a matcher that has to agree with
+  // dotenv.parse(): dotenv reads the token, this deletes it. When the two
+  // disagreed, a store written in any of these forms kept its plaintext refresh
+  // token on disk forever while the migration reported success — defeating the
+  // at-rest encryption entirely, with no functional symptom because
+  // resolveRefreshToken() prefers the ciphertext.
+  describe.each([
+    ['export prefix', 'export QUICKBOOKS_REFRESH_TOKEN=old-token'],
+    ['leading whitespace', '  QUICKBOOKS_REFRESH_TOKEN=old-token'],
+    ['colon separator', 'QUICKBOOKS_REFRESH_TOKEN: old-token'],
+    ['spaced equals', 'QUICKBOOKS_REFRESH_TOKEN = old-token'],
+    ['export plus spacing', 'export  QUICKBOOKS_REFRESH_TOKEN  =  old-token'],
+  ])('plaintext removal — %s', (_label, plaintextLine) => {
+    it('drops the plaintext line and writes the encrypted one', async () => {
+      storeContent = `${plaintextLine}\nQUICKBOOKS_REALM_ID=99999\n`;
+
+      await quickbooksClient.authenticate();
+
+      const content = writeFileSyncSpy.mock.calls.at(-1)![1] as string;
+
+      // The secret itself is gone from the file, in any form.
+      expect(content).not.toContain('old-token');
+      expect(content.split('\n')).not.toContain(plaintextLine);
+      // And the replacement really is the live token, encrypted.
+      expect(decryptWritten(content)).toBe(`rotated-${tokenCounter}`);
+    });
+  });
+
+  it('keeps the _ENC line when removing the plaintext one (no prefix over-match)', async () => {
+    // QUICKBOOKS_REFRESH_TOKEN is a strict prefix of QUICKBOOKS_REFRESH_TOKEN_ENC,
+    // so a looser matcher would strip the ciphertext it just wrote.
+    storeContent =
+      'QUICKBOOKS_REFRESH_TOKEN_ENC=stale:blob:here\nQUICKBOOKS_REALM_ID=99999\n';
+
+    await quickbooksClient.authenticate();
+
+    const content = writeFileSyncSpy.mock.calls.at(-1)![1] as string;
+    const encLines = content.split('\n').filter((l) => l.startsWith('QUICKBOOKS_REFRESH_TOKEN_ENC='));
+    expect(encLines).toHaveLength(1); // replaced in place, not duplicated or dropped
+    expect(decryptWritten(content)).toBe(`rotated-${tokenCounter}`);
+  });
+
+  it('updates an export-prefixed realm id in place instead of appending a duplicate', async () => {
+    // Same matcher powers the update path, where the old prefix check appended a
+    // second assignment rather than replacing the existing one.
+    storeContent = 'QUICKBOOKS_REFRESH_TOKEN=old-token\nexport QUICKBOOKS_REALM_ID=99999\n';
+
+    await quickbooksClient.authenticate();
+
+    const content = writeFileSyncSpy.mock.calls.at(-1)![1] as string;
+    const realmLines = content.split('\n').filter((l) => /QUICKBOOKS_REALM_ID\s*(?:=|:\s)/.test(l));
+    expect(realmLines).toHaveLength(1);
   });
 });
